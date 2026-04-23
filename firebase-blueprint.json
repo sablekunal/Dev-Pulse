@@ -23,6 +23,7 @@
         "confidenceScore": { "type": "number" },
         "issuesFound": { "type": "array", "items": { "type": "string" } },
         "recommendedFix": { "type": "string" },
+        "suggestedPatch": { "type": "string" },
         "screenshotUrl": { "type": "string" },
         "createdAt": { "type": "string", "format": "date-time" }
       },

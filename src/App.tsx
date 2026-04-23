@@ -19,7 +19,7 @@ import {
   LogIn,
   LogOut
 } from 'lucide-react';
-import { collection, addDoc, onSnapshot, query, where, orderBy, doc, updateDoc, Timestamp, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, onSnapshot, query, where, orderBy, doc, updateDoc, Timestamp, serverTimestamp, limit } from 'firebase/firestore';
 import { onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut } from 'firebase/auth';
 import { db, auth } from './lib/firebase';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -41,6 +41,7 @@ interface ScanReport {
   confidenceScore: number;
   issuesFound: string[];
   recommendedFix: string;
+  suggestedPatch?: string;
 }
 
 export default function App() {
@@ -49,6 +50,8 @@ export default function App() {
   const [scanningId, setScanningId] = useState<string | null>(null);
   const [user, setUser] = useState<any>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const [latestScan, setLatestScan] = useState<any>(null);
   const [newProject, setNewProject] = useState({ name: '', url: '' });
 
   // Gemini Setup
@@ -137,6 +140,10 @@ export default function App() {
         - Massive whitespace indicating failed loads
         - "Server Busy" or Timeout screens
         
+        IF YOU FIND ISSUES: 
+        Provide a 'suggestedPatch'. This should be a block of code (CSS, React, or HTML) that specifically fixes the visual regression or error shown. 
+        Wrap it as a string. If the status is 'Healthy', leave it as an empty string.
+
         Respond ONLY in structured JSON format.
       `;
 
@@ -154,9 +161,10 @@ export default function App() {
               status: { type: Type.STRING, description: "One word status: Healthy, Degraded, or Critical" },
               confidenceScore: { type: Type.NUMBER },
               issuesFound: { type: Type.ARRAY, items: { type: Type.STRING } },
-              recommendedFix: { type: Type.STRING }
+              recommendedFix: { type: Type.STRING },
+              suggestedPatch: { type: Type.STRING }
             },
-            required: ["status", "confidenceScore", "issuesFound", "recommendedFix"]
+            required: ["status", "confidenceScore", "issuesFound", "recommendedFix", "suggestedPatch"]
           }
         }
       });
@@ -309,14 +317,30 @@ export default function App() {
                         </a>
                       </p>
                     </div>
-                    <span className={cn(
-                      "px-2 py-0.5 text-[9px] font-bold rounded uppercase mono",
-                      project.status === 'healthy' ? "bg-emerald-500/10 text-emerald-500" : 
-                      project.status === 'critical' ? "bg-rose-500/10 text-rose-500" :
-                      "bg-zinc-500/10 text-zinc-400"
-                    )}>
+                    <div 
+                      onClick={() => {
+                        if (project.status !== 'unknown') {
+                          setSelectedProject(project);
+                          // Fetch latest scan for this project
+                          const q = query(
+                            collection(db, 'projects', project.id, 'scans'), 
+                            orderBy('createdAt', 'desc'), 
+                            limit(1)
+                          );
+                          onSnapshot(q, (sn) => {
+                            if (!sn.empty) setLatestScan(sn.docs[0].data());
+                          });
+                        }
+                      }}
+                      className={cn(
+                        "px-2 py-0.5 text-[9px] font-bold rounded uppercase mono cursor-pointer hover:opacity-80 transition-opacity",
+                        project.status === 'healthy' ? "bg-emerald-500/10 text-emerald-500" : 
+                        project.status === 'critical' ? "bg-rose-500/10 text-rose-500" :
+                        "bg-zinc-500/10 text-zinc-400"
+                      )}
+                    >
                       {project.status || 'Idle'}
-                    </span>
+                    </div>
                   </div>
 
                   <div className="space-y-4 mb-6">
@@ -440,6 +464,91 @@ export default function App() {
                   </button>
                 </div>
               </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Remediation Workspace */}
+      <AnimatePresence>
+        {selectedProject && latestScan && (
+          <div className="fixed inset-0 z-50 flex items-center justify-end p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => {
+                setSelectedProject(null);
+                setLatestScan(null);
+              }}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              className="relative w-full max-w-2xl h-full bg-[#0A0A0A] border-l border-zinc-800 p-8 overflow-y-auto"
+            >
+              <div className="flex justify-between items-center mb-8">
+                <h3 className="text-xl font-bold uppercase mono"> Remediation <span className="text-rose-500 italic">Workspace</span></h3>
+                <button onClick={() => setSelectedProject(null)} className="p-2 hover:bg-white/5 rounded">
+                  <RefreshCw className="w-4 h-4 rotate-45" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6 mb-8 text-[10px] mono uppercase tracking-wider">
+                <div className="glass p-4 rounded border-zinc-800">
+                  <span className="text-zinc-500 block mb-1">Status</span>
+                  <span className={latestScan.status.toLowerCase() === 'healthy' ? 'text-emerald-400' : 'text-rose-400'}>
+                    {latestScan.status}
+                  </span>
+                </div>
+                <div className="glass p-4 rounded border-zinc-800">
+                  <span className="text-zinc-500 block mb-1">Confidence</span>
+                  <span>{(latestScan.confidenceScore * 100).toFixed(1)}%</span>
+                </div>
+              </div>
+
+              <div className="mb-8">
+                <h4 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 mono mb-3">Identified Issues</h4>
+                <ul className="space-y-2">
+                  {latestScan.issuesFound.map((issue: string, i: number) => (
+                    <li key={i} className="flex gap-3 text-xs text-zinc-300">
+                      <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+                      {issue}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {latestScan.suggestedPatch && (
+                <div className="mb-8">
+                  <h4 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 mono mb-3">Auto-Remediation Patch</h4>
+                  <div className="relative group">
+                    <pre className="bg-black border border-zinc-800 rounded-xl p-6 overflow-x-auto text-[11px] mono text-emerald-400/80 leading-relaxed shadow-inner">
+                      {latestScan.suggestedPatch}
+                    </pre>
+                    <button 
+                      onClick={() => {
+                        navigator.clipboard.writeText(latestScan.suggestedPatch);
+                      }}
+                      className="absolute top-4 right-4 p-2 bg-zinc-800 rounded hover:bg-zinc-700 opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <Terminal className="w-3 h-3 text-zinc-400" />
+                    </button>
+                  </div>
+                  <p className="text-[9px] text-zinc-600 mt-2 uppercase tracking-wide mono italic">
+                    Note: AI suggested code. Review before deployment.
+                  </p>
+                </div>
+              )}
+
+              {latestScan.screenshotUrl && (
+                <div>
+                  <h4 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 mono mb-3">Capture Context</h4>
+                  <img src={latestScan.screenshotUrl} className="w-full rounded-xl border border-zinc-800 grayscale hover:grayscale-0 transition-all duration-700" alt="Capture" />
+                </div>
+              )}
             </motion.div>
           </div>
         )}

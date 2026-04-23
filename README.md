@@ -2,6 +2,7 @@
 
 Dev-Pulse is an AI-powered Site Reliability Engineering (SRE) platform built for proactive visual monitoring. Unlike traditional logging tools that track server-side metrics, Dev-Pulse uses a headless browser "agent" to see exactly what your users see, catching UI regressions, layout breakages, and silent failures in real-time.
 
+https://github.com/user-attachments/assets/bf9f8bae-74a1-4eb1-85e5-66dda14b4c82
 ## 🛰️ Core Features
 
 ### 1. Autonomous Visual Agent

@@ -17,7 +17,9 @@ import {
   Shield,
   Clock,
   LogIn,
-  LogOut
+  LogOut,
+  Globe,
+  LayoutGrid
 } from 'lucide-react';
 import { collection, addDoc, onSnapshot, query, where, orderBy, doc, updateDoc, Timestamp, serverTimestamp, limit } from 'firebase/firestore';
 import { onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut } from 'firebase/auth';
@@ -25,6 +27,7 @@ import { db, auth } from './lib/firebase';
 import { GoogleGenAI, Type } from '@google/genai';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
+import LandingPage from './components/LandingPage';
 
 // Types
 interface Project {
@@ -50,58 +53,61 @@ export default function App() {
   const [scanningId, setScanningId] = useState<string | null>(null);
   const [user, setUser] = useState<any>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [latestScan, setLatestScan] = useState<any>(null);
   const [newProject, setNewProject] = useState({ name: '', url: '' });
+  const [ticker, setTicker] = useState("");
 
   // Gemini Setup
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
   useEffect(() => {
-    // Auth Listener
+    const interval = setInterval(() => {
+      setTicker(Math.random().toString(16).substring(2, 20).toUpperCase());
+    }, 100);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
     const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
       setUser(u);
       if (!u) setLoading(false);
     });
-
     return () => unsubscribeAuth();
   }, []);
 
   const handleLogin = async () => {
+    if (isLoggingIn) return;
+    setIsLoggingIn(true);
     try {
       const provider = new GoogleAuthProvider();
       await signInWithPopup(auth, provider);
-    } catch (err) {
-      console.error("Login failed:", err);
+    } catch (err: any) {
+      if (err.code !== 'auth/cancelled-popup-request') console.error("Login failed:", err);
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
   const handleLogout = async () => {
-    try {
-      await signOut(auth);
-    } catch (err) {
-      console.error("Logout failed:", err);
-    }
+    try { await signOut(auth); } catch (err) { console.error("Logout failed:", err); }
   };
 
   useEffect(() => {
     if (!user) return;
-
-    // Projects Listener
     const q = query(collection(db, 'projects'), where('ownerId', '==', user.uid));
     const unsubscribeProjects = onSnapshot(q, (snapshot) => {
       const projectsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Project));
       setProjects(projectsData);
       setLoading(false);
     });
-
     return () => unsubscribeProjects();
   }, [user]);
 
   const addProject = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) return;
-
     try {
       await addDoc(collection(db, 'projects'), {
         ...newProject,
@@ -111,41 +117,22 @@ export default function App() {
       });
       setNewProject({ name: '', url: '' });
       setShowAddModal(false);
-    } catch (err) {
-      console.error("Error adding project:", err);
-    }
+    } catch (err) { console.error("Error adding project:", err); }
   };
 
   const runScan = async (project: Project) => {
     if (scanningId) return;
     setScanningId(project.id);
-
     try {
-      // 1. Take Screenshot via Backend
       const scanResponse = await fetch('/api/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: project.url })
       });
-
       if (!scanResponse.ok) throw new Error("Failed to capture screenshot");
       const { screenshot, mimeType } = await scanResponse.json();
-
-      // 2. Analyze with Gemini
-      const analysisPrompt = `
-        Analyze this website screenshot for SRE and UX health. 
-        Look for:
-        - Visible error messages (404, 500, etc.)
-        - Broken layouts or overlapping elements
-        - Massive whitespace indicating failed loads
-        - "Server Busy" or Timeout screens
-        
-        IF YOU FIND ISSUES: 
-        Provide a 'suggestedPatch'. This should be a block of code (CSS, React, or HTML) that specifically fixes the visual regression or error shown. 
-        Wrap it as a string. If the status is 'Healthy', leave it as an empty string.
-
-        Respond ONLY in structured JSON format.
-      `;
+      
+      const analysisPrompt = `Analyze this website screenshot for SRE and UX health. Respond ONLY in structured JSON format. IF YOU FIND ISSUES: Provide a 'suggestedPatch'. This should be a block of code (CSS, React, or HTML) that fixes the issue. If healthy, leave suggestedPatch as an empty string.`;
 
       const geminiResponse = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
@@ -158,7 +145,7 @@ export default function App() {
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              status: { type: Type.STRING, description: "One word status: Healthy, Degraded, or Critical" },
+              status: { type: Type.STRING },
               confidenceScore: { type: Type.NUMBER },
               issuesFound: { type: Type.ARRAY, items: { type: Type.STRING } },
               recommendedFix: { type: Type.STRING },
@@ -170,297 +157,356 @@ export default function App() {
       });
 
       const report: ScanReport = JSON.parse(geminiResponse.text || '{}');
-
-      // 3. Save Results
       const finalStatus = report.status.toLowerCase() === 'healthy' ? 'healthy' : 'critical';
       
-      await updateDoc(doc(db, 'projects', project.id), {
-        status: finalStatus,
-        lastScanAt: serverTimestamp()
-      });
-
-      await addDoc(collection(db, 'projects', project.id, 'scans'), {
-        ...report,
-        createdAt: serverTimestamp(),
-        screenshotUrl: `data:${mimeType};base64,${screenshot}` // Storing small screenshot for history
-      });
-
-    } catch (err) {
-      console.error("Scan failed:", err);
-    } finally {
-      setScanningId(null);
-    }
+      await updateDoc(doc(db, 'projects', project.id), { status: finalStatus, lastScanAt: serverTimestamp() });
+      await addDoc(collection(db, 'projects', project.id, 'scans'), { ...report, createdAt: serverTimestamp(), screenshotUrl: `data:${mimeType};base64,${screenshot}` });
+    } catch (err) { console.error("Scan failed:", err); } finally { setScanningId(null); }
   };
 
-  if (!user && !loading) {
-    return (
-      <div className="min-h-screen bg-[#09090B] text-[#FAFAFA] font-sans flex items-center justify-center p-6">
-        <div className="max-w-md w-full glass p-10 rounded-3xl text-center border-emerald-500/10 shadow-2xl relative overflow-hidden">
-          <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/5 blur-[64px] rounded-full" />
-          
-          <div className="w-16 h-16 bg-emerald-500 rounded-2xl flex items-center justify-center mx-auto mb-8 shadow-[0_0_30px_rgba(16,185,129,0.3)]">
-            <Activity className="w-8 h-8 text-black" />
-          </div>
-          
-          <h1 className="text-3xl font-bold tracking-tight uppercase mono mb-2">Dev-Pulse</h1>
-          <p className="text-zinc-500 text-sm uppercase mono tracking-widest mb-10">Autonomous SRE Matrix</p>
-          
-          <div className="space-y-4">
-            <button 
-              onClick={handleLogin}
-              className="w-full bg-zinc-100 text-zinc-900 py-4 rounded-xl font-bold uppercase tracking-widest hover:bg-white transition-all flex items-center justify-center gap-3 shadow-lg"
-            >
-              <LogIn className="w-5 h-5" />
-              Initialize Session
-            </button>
-            <p className="text-[10px] text-zinc-600 uppercase tracking-widest mono pt-4">
-              Authorized personnel only // System: SECURE
-            </p>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  if (!user && !loading) return <LandingPage onLogin={handleLogin} isLoggingIn={isLoggingIn} />;
 
   return (
-    <div className="min-h-screen bg-[#09090B] text-[#FAFAFA] font-sans selection:bg-emerald-500/30 overflow-x-hidden">
-      {/* Header */}
-      <header className="border-b border-zinc-800 bg-black/40 backdrop-blur-md sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-3 h-3 bg-emerald-500 rounded-full animate-pulse shadow-[0_0_10px_rgba(16,185,129,1)]" />
+    <div className="min-h-screen bg-[#030014] text-white font-sans selection:bg-indigo-500/30 overflow-x-hidden relative">
+      {/* Aurora Background Elements */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-indigo-900/20 blur-[120px] animate-pulse" />
+        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full bg-purple-900/20 blur-[120px] animate-pulse" style={{ animationDelay: '2s' }} />
+        <div className="absolute top-[20%] right-[10%] w-[30%] h-[30%] rounded-full bg-blue-900/10 blur-[100px]" />
+      </div>
+
+      {/* Floating Island Container */}
+      <div className="max-w-[1400px] mx-auto min-h-screen p-4 md:p-8 relative z-10">
+        
+        {/* Navigation Glass Pane */}
+        <header className="bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-[32px] p-6 mb-8 flex items-center justify-between shadow-[0_8px_32px_0_rgba(0,0,0,0.36)]">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+              <Activity className="w-7 h-7 text-white" />
+            </div>
             <div>
-              <h1 className="text-xl font-bold tracking-tight uppercase mono">
-                Dev-Pulse<span className="text-zinc-500 font-normal ml-2 tracking-normal capitalize font-sans">// Autonomous SRE</span>
-              </h1>
+              <h1 className="text-2xl font-bold tracking-tight">Dev-Pulse</h1>
+              <p className="text-[10px] text-indigo-200/40 uppercase tracking-widest font-semibold">Autonomous SRE Matrix</p>
             </div>
           </div>
+
+          <div className="flex items-center gap-6">
+            <div className="hidden sm:flex items-center gap-4 px-4 py-2 bg-white/5 rounded-full border border-white/5">
+              <div className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+              <span className="text-xs font-medium text-emerald-400">System Active</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={() => setShowAddModal(true)}
+                className="bg-indigo-500 hover:bg-indigo-400 text-white rounded-full px-6 py-2.5 text-xs font-bold transition-all shadow-[0_0_20px_rgba(99,102,241,0.4)] active:scale-95 flex items-center gap-2"
+              >
+                <Plus className="w-4 h-4" />
+                New Node
+              </button>
+              <button 
+                onClick={handleLogout}
+                className="p-2.5 bg-white/5 hover:bg-white/10 rounded-full border border-white/5 text-indigo-200/60 hover:text-white transition-all"
+              >
+                <LogOut className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <div className="grid grid-cols-12 gap-8 items-start">
           
-          <div className="flex items-center gap-8 text-[10px] uppercase tracking-widest mono text-zinc-400">
-            <div className="hidden md:block">System: <span className="text-emerald-400">Operational</span></div>
-            {user && (
-              <>
-                <div className="hidden lg:block">Uptime: <span className="text-zinc-100">99.982%</span></div>
-                <button 
-                  onClick={() => setShowAddModal(true)}
-                  className="px-4 py-2 bg-zinc-100 text-zinc-900 rounded font-bold uppercase tracking-wider hover:bg-white transition-colors"
-                >
-                  New Node
-                </button>
-                <button 
-                  onClick={handleLogout}
-                  className="p-2 hover:text-white transition-colors"
-                  title="Logout"
-                >
-                  <LogOut className="w-4 h-4" />
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      </header>
-
-      <main className="max-w-7xl mx-auto px-6 py-12">
-        {/* Welcome Section */}
-        <div className="mb-12 flex flex-col md:flex-row md:items-end md:justify-between gap-4">
-          <div>
-            <h2 className="text-3xl font-bold tracking-tight mb-2 uppercase mono">
-              Fleet <span className="text-emerald-500 italic">Status</span>
-            </h2>
-            <p className="text-zinc-500 max-w-xl text-xs uppercase mono tracking-wider">
-              Real-time site reliability matrix // AI-powered visual regression analysis
-            </p>
-          </div>
-          <div className="flex items-center gap-4 text-[10px] mono text-zinc-600">
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-emerald-500" />
-              <span>Healthy</span>
+          {/* Left Column: BENTO FLEET GRID */}
+          <div className="col-span-12 lg:col-span-8">
+            <div className="flex items-center justify-between mb-8 px-4">
+              <h2 className="text-3xl font-bold tracking-tight">Fleet <span className="text-indigo-400">Topology</span></h2>
+              <div className="text-xs text-indigo-200/60 font-medium">Monitoring {projects.length} Active Nodes</div>
             </div>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-rose-500" />
-              <span>Critical</span>
-            </div>
-          </div>
-        </div>
 
-        {/* Dashboard Grid */}
-        {loading ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {[1, 2, 3].map(i => (
-              <div key={i} className="h-64 glass rounded-xl animate-pulse" />
-            ))}
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            <AnimatePresence mode="popLayout">
-              {projects.map((project) => (
-                <motion.div
-                  key={project.id}
-                  layout
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.95 }}
-                  className={cn(
-                    "glass p-6 rounded-xl border-l-4 flex flex-col justify-between transition-all duration-300",
-                    project.status === 'healthy' ? "border-l-emerald-500 glow-green" : 
-                    project.status === 'critical' ? "border-l-rose-500 glow-red" :
-                    "border-l-zinc-700"
-                  )}
-                >
-                  <div className="flex justify-between items-start mb-6">
-                    <div>
-                      <h3 className="text-lg font-semibold tracking-tight">{project.name}</h3>
-                      <p className="text-[10px] text-zinc-500 mono mt-1 flex items-center gap-1">
-                        <span className="truncate max-w-[150px]">{project.url}</span>
-                        <a href={project.url} target="_blank" rel="noreferrer" className="hover:text-zinc-300">
-                          <ExternalLink className="w-2 h-2" />
-                        </a>
-                      </p>
-                    </div>
-                    <div 
-                      onClick={() => {
-                        if (project.status !== 'unknown') {
-                          setSelectedProject(project);
-                          // Fetch latest scan for this project
-                          const q = query(
-                            collection(db, 'projects', project.id, 'scans'), 
-                            orderBy('createdAt', 'desc'), 
-                            limit(1)
-                          );
-                          onSnapshot(q, (sn) => {
-                            if (!sn.empty) setLatestScan(sn.docs[0].data());
-                          });
-                        }
-                      }}
-                      className={cn(
-                        "px-2 py-0.5 text-[9px] font-bold rounded uppercase mono cursor-pointer hover:opacity-80 transition-opacity",
-                        project.status === 'healthy' ? "bg-emerald-500/10 text-emerald-500" : 
-                        project.status === 'critical' ? "bg-rose-500/10 text-rose-500" :
-                        "bg-zinc-500/10 text-zinc-400"
-                      )}
-                    >
-                      {project.status || 'Idle'}
-                    </div>
-                  </div>
-
-                  <div className="space-y-4 mb-6">
-                    <div className="flex justify-between text-[10px] uppercase tracking-wider">
-                      <span className="text-zinc-500 mono">Node Data</span>
-                      <span className={cn(
-                        "mono",
-                        project.status === 'healthy' ? "text-emerald-400" : 
-                        project.status === 'critical' ? "text-rose-400" :
-                        "text-zinc-400"
-                      )}>
-                        {project.status === 'healthy' ? "Stable" : project.status === 'critical' ? "Regression" : "Awaiting Trigger"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between text-[10px] uppercase tracking-wider">
-                      <span className="text-zinc-500 mono">Last Sync</span>
-                      <span className="text-zinc-300 mono">
-                        {project.lastScanAt ? new Date(project.lastScanAt.toDate()).toLocaleTimeString() : 'Never'}
-                      </span>
-                    </div>
-                  </div>
-
-                  <button 
-                    onClick={() => runScan(project)}
-                    disabled={scanningId === project.id}
-                    className={cn(
-                      "w-full py-2.5 text-[10px] font-bold uppercase tracking-widest rounded transition-all duration-300 mono",
-                      scanningId === project.id 
-                        ? "bg-zinc-800 text-zinc-500 cursor-not-allowed" 
-                        : "bg-zinc-100 text-zinc-900 hover:bg-white"
-                    )}
-                  >
-                    {scanningId === project.id ? (
-                      <span className="flex items-center justify-center gap-2">
-                        <RefreshCw className="w-3 h-3 animate-spin" />
-                        Analyzing...
-                      </span>
-                    ) : (
-                      "Run Agent Scan"
-                    )}
-                  </button>
-                </motion.div>
-              ))}
-            </AnimatePresence>
-            
-            {/* Empty State Help */}
-            {projects.length === 0 && !loading && (
-              <div className="col-span-full py-24 glass rounded-3xl flex flex-col items-center justify-center text-center border-dashed border-zinc-800">
-                <div className="w-12 h-12 glass rounded flex items-center justify-center mb-4 border-zinc-700">
-                  <Terminal className="w-5 h-5 text-zinc-500" />
+            {loading ? (
+              <div className="grid sm:grid-cols-2 gap-6">
+                {[1, 2, 3, 4].map(i => (
+                  <div key={i} className="h-48 bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-3xl animate-pulse" />
+                ))}
+              </div>
+            ) : projects.length === 0 ? (
+              <div className="bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-[48px] p-20 text-center shadow-[0_8px_32px_0_rgba(0,0,0,0.36)]">
+                <div className="w-20 h-20 bg-indigo-500/10 rounded-full flex items-center justify-center mx-auto mb-8 border border-indigo-500/20">
+                  <Terminal className="w-10 h-10 text-indigo-400" />
                 </div>
-                <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-widest mono">No nodes deployed</h3>
-                <p className="text-zinc-600 text-[10px] max-w-sm mt-2 uppercase tracking-wide mono">
-                  Connect your endpoints to the Pulse grid
+                <h3 className="text-xl font-bold mb-3">No active nodes found</h3>
+                <p className="text-indigo-200/40 text-sm max-w-xs mx-auto mb-10 leading-relaxed">
+                  Connect your first endpoint to initialize autonomous visual monitoring and regression detection.
                 </p>
                 <button 
                   onClick={() => setShowAddModal(true)}
-                  className="mt-6 text-emerald-500 text-[10px] tracking-widest uppercase font-bold hover:text-emerald-400 mono"
+                  className="px-10 py-4 bg-indigo-500 rounded-full text-sm font-black uppercase tracking-widest shadow-xl shadow-indigo-500/20 hover:scale-105 transition-transform"
                 >
-                  [ Initialize Deployment ]
+                  Deploy First Node
                 </button>
+              </div>
+            ) : (
+              <div className="relative">
+                {/* Agent Cursor Decoration */}
+                <motion.div
+                  animate={{
+                    x: [100, 500, 200, 600, 100],
+                    y: [50, 250, 400, 150, 50],
+                  }}
+                  transition={{
+                    duration: 30,
+                    repeat: Infinity,
+                    ease: "easeInOut"
+                  }}
+                  className="absolute pointer-events-none z-20 hidden xl:block"
+                >
+                   <div className="flex items-center gap-2">
+                     <div className="w-4 h-4 bg-indigo-500 rounded-full shadow-[0_0_15px_rgba(99,102,241,0.8)] border-2 border-white" />
+                     <div className="bg-indigo-500 px-2 py-0.5 rounded text-[8px] font-bold uppercase tracking-tighter text-white whitespace-nowrap shadow-lg">
+                       AI Agent Scanning
+                     </div>
+                   </div>
+                </motion.div>
+
+                <div className="grid sm:grid-cols-2 gap-6 relative z-10">
+                  <AnimatePresence mode="popLayout">
+                    {projects.map((project, idx) => (
+                      <motion.div
+                        key={project.id}
+                        layout
+                        initial={{ opacity: 0, y: 30 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.9 }}
+                        whileHover={{ y: -5, scale: 1.02 }}
+                        onClick={() => {
+                          setSelectedProject(project);
+                          const q = query(collection(db, 'projects', project.id, 'scans'), orderBy('createdAt', 'desc'), limit(1));
+                          onSnapshot(q, (sn) => { if (!sn.empty) setLatestScan(sn.docs[0].data()); });
+                        }}
+                        className={cn(
+                          "bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-3xl p-8 cursor-pointer transition-all duration-500 relative overflow-hidden shadow-sm",
+                          selectedProject?.id === project.id && "bg-white/[0.08] border-indigo-500 ring-2 ring-indigo-500/20"
+                        )}
+                      >
+                        <div className="flex justify-between items-start mb-10">
+                          <div className="flex items-center gap-4">
+                            <div className="w-12 h-12 bg-white/5 rounded-2xl flex items-center justify-center border border-white/5 group-hover:scale-110 transition-transform">
+                              {idx % 2 === 0 ? <Globe className="w-6 h-6 text-indigo-300/60" /> : <LayoutGrid className="w-6 h-6 text-indigo-300/60" />}
+                            </div>
+                            <div className="min-w-0">
+                              <h3 className="text-xl font-bold tracking-tight text-white/90 truncate">{project.name}</h3>
+                              <p className="text-[10px] text-indigo-200/40 uppercase font-bold tracking-widest mt-1">PID: {project.id.slice(0, 8)}</p>
+                            </div>
+                          </div>
+                          <div className={cn(
+                            "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                            project.status === 'healthy' ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shadow-[0_0_10px_rgba(52,211,153,0.1)]" : 
+                            project.status === 'critical' ? "bg-rose-500/10 text-rose-400 border border-rose-500/20 shadow-[0_0_10px_rgba(251,113,133,0.1)]" :
+                            "bg-white/5 text-zinc-500 border border-white/5"
+                          )}>
+                            {project.status || 'Checking'}
+                          </div>
+                        </div>
+
+                        <div className="mb-10">
+                          <div className="text-[10px] text-indigo-200/30 uppercase tracking-widest font-bold mb-2">Endpoint URL</div>
+                          <p className="text-sm text-indigo-200/60 truncate font-medium">{project.url}</p>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-4">
+                           <div className="text-[10px] text-indigo-200/30 uppercase tracking-widest font-bold">
+                             {project.lastScanAt ? "Active Scan System" : "Deployment Pending"}
+                           </div>
+                           <button 
+                            onClick={(e) => { e.stopPropagation(); runScan(project); }}
+                            disabled={scanningId === project.id}
+                            className={cn(
+                              "px-6 py-3 rounded-2xl text-[11px] font-bold transition-all duration-300 relative overflow-hidden",
+                              scanningId === project.id 
+                                ? "bg-white/5 text-zinc-600 cursor-not-allowed" 
+                                : "bg-indigo-500 hover:bg-indigo-400 text-white shadow-lg shadow-indigo-500/10"
+                            )}
+                          >
+                            {scanningId === project.id ? (
+                              <div className="flex items-center gap-2">
+                                <RefreshCw className="w-3 h-3 animate-spin" />
+                                Analyzing...
+                              </div>
+                            ) : (
+                              "Run Agent Scan"
+                            )}
+                          </button>
+                        </div>
+
+                        {/* Subtle background glow */}
+                        <div className={cn(
+                          "absolute -bottom-10 -right-10 w-32 h-32 blur-[50px] opacity-20 pointer-events-none transition-colors duration-1000",
+                          project.status === 'healthy' ? "bg-emerald-500" : project.status === 'critical' ? "bg-rose-500" : "bg-indigo-500"
+                        )} />
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+                </div>
               </div>
             )}
           </div>
-        )}
-      </main>
 
-      {/* Add Project Modal */}
+          {/* Right Column: AI REMEDIATION HUB */}
+          <div className="col-span-12 lg:col-span-4 lg:sticky lg:top-8">
+            {!selectedProject ? (
+              <div className="bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-[40px] p-12 text-center min-h-[600px] flex flex-col items-center justify-center shadow-[0_8px_32px_0_rgba(0,0,0,0.36)]">
+                <div className="relative mb-8">
+                  <Activity className="w-16 h-16 text-indigo-500 animate-pulse relative z-10" />
+                  <div className="absolute inset-0 bg-indigo-500/20 blur-[40px] animate-pulse" />
+                </div>
+                <h3 className="text-xl font-bold mb-4">Intelligence <span className="text-indigo-400">Standby</span></h3>
+                <p className="text-indigo-200/40 text-sm leading-relaxed max-w-[240px]">
+                  Select a node from the topology map to initialize the autonomous remediation pipeline.
+                </p>
+              </div>
+            ) : latestScan ? (
+              <motion.div 
+                initial={{ opacity: 0, x: 50 }}
+                animate={{ opacity: 1, x: 0 }}
+                className="bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-[40px] p-10 overflow-hidden shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] h-full"
+              >
+                <div className="flex items-center justify-between mb-12">
+                  <h3 className="text-xl font-bold">Analysis <span className="text-indigo-400">Report</span></h3>
+                  <div className="text-[10px] text-indigo-200/40 font-black uppercase tracking-[0.2em]">{selectedProject.name}</div>
+                </div>
+
+                {/* Confidence Bar */}
+                <div className="mb-12">
+                  <div className="flex justify-between items-end mb-4">
+                    <div className="text-[11px] font-bold text-indigo-200/60 uppercase tracking-widest">AI Confidence</div>
+                    <div className="text-2xl font-black text-indigo-400">{(latestScan.confidenceScore * 100).toFixed(0)}%</div>
+                  </div>
+                  <div className="h-2 bg-white/5 rounded-full overflow-hidden border border-white/5">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${latestScan.confidenceScore * 100}%` }}
+                      transition={{ duration: 1.5, ease: "easeOut" }}
+                      className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 shadow-[0_0_15px_rgba(99,102,241,0.5)]"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-10">
+                  {/* Anomalies */}
+                  <div>
+                    <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-indigo-200/30 mb-6 px-1">Detected Points of Interest</h4>
+                    <div className="space-y-4">
+                      {latestScan.issuesFound.map((issue: string, i: number) => (
+                        <div key={i} className="flex gap-4 p-5 bg-white/5 rounded-3xl border border-white/5 backdrop-blur-md">
+                          <div className="w-8 h-8 rounded-full bg-rose-500/10 flex items-center justify-center shrink-0 border border-rose-500/20">
+                            <AlertCircle className="w-4 h-4 text-rose-400" />
+                          </div>
+                          <p className="text-xs text-indigo-200/80 leading-relaxed font-medium italic">"{issue}"</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Patch */}
+                  {latestScan.suggestedPatch && (
+                    <div>
+                      <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-indigo-200/30 mb-6 px-1 text-center">Autonomous Patch Generation</h4>
+                      <div className="relative group">
+                        <div className="absolute inset-0 bg-indigo-500/10 blur-[60px] opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
+                        <pre className="bg-black/40 border border-white/10 rounded-3xl p-6 text-[11px] font-mono text-indigo-300 overflow-x-auto leading-relaxed shadow-inner backdrop-blur-3xl relative z-10">
+                          <code className="text-emerald-400">
+                             {latestScan.suggestedPatch}
+                          </code>
+                        </pre>
+                        <button 
+                          onClick={() => navigator.clipboard.writeText(latestScan.suggestedPatch)}
+                          className="absolute top-4 right-4 p-3 bg-white/5 hover:bg-white/10 text-white rounded-2xl transition-all border border-white/10 backdrop-blur-xl z-20 group-hover:scale-110 active:scale-95"
+                        >
+                          <Terminal className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Vision Capture */}
+                  {latestScan.screenshotUrl && (
+                    <div>
+                      <h4 className="text-[10px] font-black uppercase tracking-[0.3em] text-indigo-200/30 mb-6 px-1">Visual Evidence Buffer</h4>
+                      <div className="rounded-[32px] overflow-hidden border border-indigo-500/20 shadow-2xl relative group">
+                        <div className="absolute inset-0 bg-indigo-500/10 opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none z-10" />
+                        <img src={latestScan.screenshotUrl} className="w-full grayscale brightness-75 hover:grayscale-0 hover:brightness-100 transition-all duration-700 scale-105 group-hover:scale-100" alt="Telemetry" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            ) : (
+              <div className="bg-white/[0.03] border border-white/[0.08] backdrop-blur-2xl rounded-[40px] p-20 text-center shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] flex flex-col items-center justify-center min-h-[600px]">
+                <RefreshCw className="w-12 h-12 text-indigo-500 animate-spin mb-8" />
+                <h3 className="text-xl font-bold mb-3 tracking-tight">Crunching Telemetry</h3>
+                <p className="text-indigo-200/30 text-[10px] uppercase font-black tracking-widest">Neural weights aligning...</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Deploy Node Modal */}
       <AnimatePresence>
         {showAddModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowAddModal(false)} className="absolute inset-0 bg-[#030014]/90 backdrop-blur-xl" />
             <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setShowAddModal(false)}
-              className="absolute inset-0 bg-black/90 backdrop-blur-sm"
-            />
-            <motion.div 
-              initial={{ scale: 0.95, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.95, opacity: 0 }}
-              className="relative w-full max-w-md glass border-emerald-500/20 rounded-2xl p-8 shadow-2xl"
+              initial={{ scale: 0.9, y: 50, opacity: 0 }} 
+              animate={{ scale: 1, y: 0, opacity: 1 }} 
+              exit={{ scale: 0.9, y: 50, opacity: 0 }} 
+              className="relative w-full max-w-lg bg-white/[0.03] border border-white/[0.1] backdrop-blur-3xl rounded-[48px] p-12 shadow-[0_32px_64px_-12px_rgba(0,0,0,0.8)] overflow-hidden"
             >
-              <h3 className="text-xl font-bold uppercase mono tracking-tight mb-8">Node <span className="text-emerald-500 italic">Registration</span></h3>
-              <form onSubmit={addProject} className="space-y-6">
-                <div>
-                  <label className="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 mono mb-2">Identifier</label>
-                  <input 
-                    required
-                    value={newProject.name}
-                    onChange={e => setNewProject({...newProject, name: e.target.value})}
-                    placeholder="E.G. CORE-ALPHA-01"
-                    className="w-full bg-zinc-900/50 border border-zinc-800 rounded px-4 py-3 text-xs focus:outline-none focus:border-emerald-500/50 transition-colors mono"
-                  />
+              <div className="absolute top-0 right-0 w-64 h-64 bg-indigo-500/10 blur-[100px] pointer-events-none" />
+              <div className="flex items-center gap-6 mb-12">
+                <div className="w-16 h-16 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-3xl flex items-center justify-center shadow-2xl">
+                  <Plus className="w-9 h-9 text-white" />
                 </div>
                 <div>
-                  <label className="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 mono mb-2">Endpoint URL</label>
+                  <h4 className="text-3xl font-black tracking-tight">Deploy Node</h4>
+                  <p className="text-xs text-indigo-200/40 uppercase font-black tracking-widest mt-1">Satellite Configuration Alpha-1</p>
+                </div>
+              </div>
+
+              <form onSubmit={addProject} className="space-y-10">
+                <div className="space-y-3">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-200/40 ml-2">Node Identifier</label>
                   <input 
-                    required
-                    type="url"
-                    value={newProject.url}
-                    onChange={e => setNewProject({...newProject, url: e.target.value})}
-                    placeholder="https://..."
-                    className="w-full bg-zinc-900/50 border border-zinc-800 rounded px-4 py-3 text-xs focus:outline-none focus:border-emerald-500/50 transition-colors mono transition-all"
+                    required 
+                    value={newProject.name} 
+                    onChange={e => setNewProject({...newProject, name: e.target.value})} 
+                    className="w-full bg-white/5 border border-white/5 hover:border-white/10 rounded-3xl px-8 py-5 text-sm outline-none focus:border-indigo-500/50 transition-all font-medium text-white placeholder:text-zinc-700 shadow-inner" 
+                    placeholder="MAIN_SYSTEM_CORE" 
                   />
                 </div>
-                <div className="pt-4 flex gap-3">
+                <div className="space-y-3">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-200/40 ml-2">Endpoint URL</label>
+                  <input 
+                    required 
+                    type="url" 
+                    value={newProject.url} 
+                    onChange={e => setNewProject({...newProject, url: e.target.value})} 
+                    className="w-full bg-white/5 border border-white/5 hover:border-white/10 rounded-3xl px-8 py-5 text-sm outline-none focus:border-indigo-500/50 transition-all font-medium text-white placeholder:text-zinc-700 shadow-inner" 
+                    placeholder="https://console.devpulse.ai" 
+                  />
+                </div>
+                <div className="flex gap-4 pt-6">
                   <button 
-                    type="button"
-                    onClick={() => setShowAddModal(false)}
-                    className="flex-1 py-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500 hover:text-zinc-300 mono"
+                    type="submit" 
+                    className="flex-1 bg-indigo-500 hover:bg-indigo-400 text-white font-black py-6 rounded-full text-xs uppercase tracking-[0.2em] transition-all hover:scale-[1.02] active:scale-95 shadow-2xl shadow-indigo-500/40"
                   >
-                    Cancel
+                    Confirm Deployment
                   </button>
                   <button 
-                    type="submit"
-                    className="flex-1 bg-emerald-600 text-white py-3 rounded text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-500 transition-all shadow-[0_0_20px_rgba(16,185,129,0.2)] mono"
+                    type="button" 
+                    onClick={() => setShowAddModal(false)} 
+                    className="px-8 bg-white/5 hover:bg-white/10 rounded-full text-xs font-bold uppercase tracking-widest transition-all text-indigo-200/60"
                   >
-                    Register Node
+                    Cancel
                   </button>
                 </div>
               </form>
@@ -468,101 +514,7 @@ export default function App() {
           </div>
         )}
       </AnimatePresence>
-
-      {/* Remediation Workspace */}
-      <AnimatePresence>
-        {selectedProject && latestScan && (
-          <div className="fixed inset-0 z-50 flex items-center justify-end p-4">
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => {
-                setSelectedProject(null);
-                setLatestScan(null);
-              }}
-              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
-            />
-            <motion.div 
-              initial={{ x: '100%' }}
-              animate={{ x: 0 }}
-              exit={{ x: '100%' }}
-              className="relative w-full max-w-2xl h-full bg-[#0A0A0A] border-l border-zinc-800 p-8 overflow-y-auto"
-            >
-              <div className="flex justify-between items-center mb-8">
-                <h3 className="text-xl font-bold uppercase mono"> Remediation <span className="text-rose-500 italic">Workspace</span></h3>
-                <button onClick={() => setSelectedProject(null)} className="p-2 hover:bg-white/5 rounded">
-                  <RefreshCw className="w-4 h-4 rotate-45" />
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-6 mb-8 text-[10px] mono uppercase tracking-wider">
-                <div className="glass p-4 rounded border-zinc-800">
-                  <span className="text-zinc-500 block mb-1">Status</span>
-                  <span className={latestScan.status.toLowerCase() === 'healthy' ? 'text-emerald-400' : 'text-rose-400'}>
-                    {latestScan.status}
-                  </span>
-                </div>
-                <div className="glass p-4 rounded border-zinc-800">
-                  <span className="text-zinc-500 block mb-1">Confidence</span>
-                  <span>{(latestScan.confidenceScore * 100).toFixed(1)}%</span>
-                </div>
-              </div>
-
-              <div className="mb-8">
-                <h4 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 mono mb-3">Identified Issues</h4>
-                <ul className="space-y-2">
-                  {latestScan.issuesFound.map((issue: string, i: number) => (
-                    <li key={i} className="flex gap-3 text-xs text-zinc-300">
-                      <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
-                      {issue}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-
-              {latestScan.suggestedPatch && (
-                <div className="mb-8">
-                  <h4 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 mono mb-3">Auto-Remediation Patch</h4>
-                  <div className="relative group">
-                    <pre className="bg-black border border-zinc-800 rounded-xl p-6 overflow-x-auto text-[11px] mono text-emerald-400/80 leading-relaxed shadow-inner">
-                      {latestScan.suggestedPatch}
-                    </pre>
-                    <button 
-                      onClick={() => {
-                        navigator.clipboard.writeText(latestScan.suggestedPatch);
-                      }}
-                      className="absolute top-4 right-4 p-2 bg-zinc-800 rounded hover:bg-zinc-700 opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      <Terminal className="w-3 h-3 text-zinc-400" />
-                    </button>
-                  </div>
-                  <p className="text-[9px] text-zinc-600 mt-2 uppercase tracking-wide mono italic">
-                    Note: AI suggested code. Review before deployment.
-                  </p>
-                </div>
-              )}
-
-              {latestScan.screenshotUrl && (
-                <div>
-                  <h4 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 mono mb-3">Capture Context</h4>
-                  <img src={latestScan.screenshotUrl} className="w-full rounded-xl border border-zinc-800 grayscale hover:grayscale-0 transition-all duration-700" alt="Capture" />
-                </div>
-              )}
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Footer from Design */}
-      <footer className="max-w-7xl mx-auto px-6 py-8 border-t border-zinc-800 flex flex-col md:flex-row justify-between items-center text-[10px] mono text-zinc-600 gap-4 mt-auto">
-        <p>© 2024 DEV-PULSE ARCHITECTURE // SRE-CORE-01</p>
-        <p className="flex items-center gap-4">
-          <span>LATENCY: 12ms</span>
-          <span>MEMORY: 421MB</span>
-          <span>NODE: V20.10.0</span>
-        </p>
-      </footer>
     </div>
   );
 }
+

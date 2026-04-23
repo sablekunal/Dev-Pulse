@@ -1,0 +1,6 @@
+{
+  "name": "Dev-Pulse",
+  "description": "Autonomous SRE dashboard for real-time site monitoring and AI-powered visual regression analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
